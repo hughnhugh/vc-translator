@@ -17,6 +17,7 @@ import tkinter as tk
 import numpy as np
 import pyaudiowpatch as pyaudio
 import torch
+from concurrent.futures import ThreadPoolExecutor
 from faster_whisper import WhisperModel
 from opencc import OpenCC
 
@@ -31,7 +32,7 @@ FRAME_SAMPLES = 512              # 32ms @ 16kHz, required chunk size for Silero 
 SPEECH_THRESHOLD = 0.5
 SILENCE_HANGOVER_SEC = 0.8       # how much trailing silence ends a segment
 MIN_SPEECH_SEC = 0.4             # ignore blips shorter than this
-MAX_SEGMENT_SEC = 20.0           # force a cut if someone talks forever
+MAX_SEGMENT_SEC = 6.0            # force a cut even mid-sentence so long monologues don't stall output
 
 MAX_LINES_SHOWN = 4
 
@@ -132,6 +133,8 @@ def audio_worker(stop_event: threading.Event):
         stream.start_stream()
         caption_q.put("Listening...")
 
+        executor = ThreadPoolExecutor(max_workers=1)
+
         leftover = np.zeros(0, dtype=np.float32)
         speech_buffer = []
         in_speech = False
@@ -167,15 +170,21 @@ def audio_worker(stop_event: threading.Event):
                 elif in_speech:
                     speech_buffer.append(frame)
                     silence_frames += 1
+
+                if in_speech:
                     total_frames = len(speech_buffer)
                     duration_sec = total_frames * FRAME_SAMPLES / VAD_SAMPLE_RATE
-                    if silence_frames >= silence_frames_needed or duration_sec >= MAX_SEGMENT_SEC:
+                    hit_silence_end = silence_frames >= silence_frames_needed
+                    hit_max_duration = duration_sec >= MAX_SEGMENT_SEC
+                    if hit_silence_end or hit_max_duration:
                         if total_frames - silence_frames >= min_speech_frames:
                             segment = np.concatenate(speech_buffer)
-                            process_segment(whisper_model, segment)
+                            executor.submit(process_segment, whisper_model, segment)
                         speech_buffer = []
-                        in_speech = False
                         silence_frames = 0
+                        # a forced max-duration cut doesn't mean silence started -
+                        # keep accumulating the next chunk right away
+                        in_speech = not hit_silence_end
 
         stream.stop_stream()
         stream.close()
