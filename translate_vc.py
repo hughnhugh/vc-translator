@@ -25,9 +25,10 @@ import torch
 from opencc import OpenCC
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
+import speaker_store
 from lang_codes import WHISPER_TO_FLORES as LANG_TO_FLORES
 from lang_codes import validate_flores_codes
-from overlay_core import caption_q, is_reliable_transcription, run_translator
+from overlay_core import VAD_SAMPLE_RATE, caption_q, is_reliable_transcription, run_translator
 
 _t2s = OpenCC("t2s")
 _s2t = OpenCC("s2t")
@@ -38,9 +39,11 @@ _s2t = OpenCC("s2t")
 CHINESE_TARGETS = {"zh": _t2s, "zh-hant": _s2t}
 
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
+SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
 _nllb_tokenizer = None
 _nllb_model = None
+_speaker_classifier = None
 
 
 def _load_nllb():
@@ -62,12 +65,45 @@ def translate_text(text, src_flores, target_flores):
     return tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip()
 
 
+def _load_speaker_model():
+    global _speaker_classifier
+    if _speaker_classifier is None:
+        from speechbrain.inference.speaker import EncoderClassifier
+        from speechbrain.utils.fetching import LocalStrategy
+
+        caption_q.put(f"Loading speaker ID model ({SPEAKER_MODEL})...")
+        _speaker_classifier = EncoderClassifier.from_hparams(
+            source=SPEAKER_MODEL,
+            savedir="pretrained_models/spkrec-ecapa-voxceleb",
+            run_opts={"device": "cuda:0"},
+            local_strategy=LocalStrategy.COPY,  # symlinks need admin/dev-mode privileges on Windows
+        )
+    return _speaker_classifier
+
+
+def identify_speaker(segment_audio):
+    classifier = _load_speaker_model()
+    wav = torch.from_numpy(segment_audio).unsqueeze(0)
+    with torch.no_grad():
+        embedding = classifier.encode_batch(wav).squeeze().cpu().numpy()
+    duration_sec = len(segment_audio) / VAD_SAMPLE_RATE
+    return speaker_store.identify(embedding, duration_sec)
+
+
+def _emit_caption(lead, speaker_id, lang, elapsed, native_text, translated_text=None):
+    body = f"[{lang}, {elapsed:.1f}s] {native_text}"
+    if translated_text is not None:
+        body += f"\n    -> {translated_text}"
+    if speaker_id:
+        caption_q.put({"text": f"{lead}{body}", "speaker_id": speaker_id, "speaker_label": lead.strip()})
+    else:
+        caption_q.put(f"{lead}{body}")
+
+
 def make_process_segment(target_lang):
     target_flores = LANG_TO_FLORES[target_lang]
 
     def process_segment(model, segment, source_tag=""):
-        prefix = "[You] " if source_tag == "mic" else ""
-
         t0 = time.time()
         segments_gen, info = model.transcribe(
             segment,
@@ -85,19 +121,25 @@ def make_process_segment(target_lang):
         if not native_text:
             return
 
+        if source_tag == "mic":
+            lead, speaker_id = "[You] ", None
+        else:
+            speaker_id, speaker_label = identify_speaker(segment)
+            lead = f"{speaker_label} "
+
         if info.language == "zh":
             native_text = _t2s.convert(native_text)  # normalize display text to Simplified
 
             if target_lang in CHINESE_TARGETS:
                 elapsed = time.time() - t0
                 shown = CHINESE_TARGETS[target_lang].convert(native_text)
-                caption_q.put(f"{prefix}[{info.language}, {elapsed:.1f}s] {shown}")
+                _emit_caption(lead, speaker_id, info.language, elapsed, shown)
                 return
 
         if info.language == target_lang:
             # already the target language - nothing to translate
             elapsed = time.time() - t0
-            caption_q.put(f"{prefix}[{info.language}, {elapsed:.1f}s] {native_text}")
+            _emit_caption(lead, speaker_id, info.language, elapsed, native_text)
             return
 
         if target_lang == "en":
@@ -130,7 +172,7 @@ def make_process_segment(target_lang):
 
         elapsed = time.time() - t0
         if translated:
-            caption_q.put(f"{prefix}[{info.language}, {elapsed:.1f}s] {native_text}\n    -> {translated}")
+            _emit_caption(lead, speaker_id, info.language, elapsed, native_text, translated)
 
     return process_segment
 

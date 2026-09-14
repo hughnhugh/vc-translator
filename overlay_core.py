@@ -13,11 +13,14 @@ import tkinter as tk
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from tkinter import simpledialog
 
 import numpy as np
 import pyaudiowpatch as pyaudio
 import torch
 from faster_whisper import WhisperModel
+
+import speaker_store
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
@@ -245,6 +248,7 @@ class OverlayApp:
         self.entry_marks = deque()
         self._mark_seq = 0
         self.log_file = log_file
+        self._configured_speaker_tags = set()
 
         root.overrideredirect(True)          # borderless
         root.attributes("-topmost", True)    # always on top
@@ -383,8 +387,9 @@ class OverlayApp:
         if new_items:
             if self.log_file:
                 for item in new_items:
+                    text = item["text"] if isinstance(item, dict) else item
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.log_file.write(f"[{timestamp}] {item}\n")
+                    self.log_file.write(f"[{timestamp}] {text}\n")
                 self.log_file.flush()
 
             at_bottom = self.text.yview()[1] >= 0.999
@@ -397,7 +402,12 @@ class OverlayApp:
                 self._mark_seq += 1
                 self.text.mark_set(mark, "end-1c")
                 self.entry_marks.append(mark)
-                self.text.insert("end", item)
+
+                if isinstance(item, dict) and item.get("speaker_id"):
+                    self._insert_with_speaker_tag(item)
+                else:
+                    text = item["text"] if isinstance(item, dict) else item
+                    self.text.insert("end", text)
 
             # trim only the oldest entry's own text range - never rebuild the
             # whole widget, or the scrollbar snaps back to the top on every update
@@ -413,6 +423,45 @@ class OverlayApp:
                 self.text.see("end")
 
         self.root.after(100, self.poll_queue)
+
+    def _insert_with_speaker_tag(self, item):
+        speaker_id = item["speaker_id"]
+        label = item["speaker_label"]
+        text = item["text"]
+        tagname = f"spk_{speaker_id}"
+
+        start = self.text.index("end-1c")
+        self.text.insert("end", label)
+        end = self.text.index("end-1c")
+        self.text.tag_add(tagname, start, end)
+
+        if tagname not in self._configured_speaker_tags:
+            self._configured_speaker_tags.add(tagname)
+            self.text.tag_config(tagname, foreground="#7ec4ff", underline=True)
+            self.text.tag_bind(tagname, "<Enter>", lambda e: self.text.config(cursor="hand2"))
+            self.text.tag_bind(tagname, "<Leave>", lambda e: self.text.config(cursor=""))
+            self.text.tag_bind(tagname, "<Button-1>", lambda e, sid=speaker_id: self.rename_speaker(sid))
+
+        # the rest of the entry after the label (which we just inserted ourselves)
+        self.text.insert("end", text[len(label):])
+
+    def rename_speaker(self, speaker_id):
+        new_name = simpledialog.askstring(
+            "Rename speaker", f"Name for Speaker_{speaker_id}:", parent=self.root
+        )
+        if not new_name:
+            return
+        speaker_store.rename(speaker_id, new_name)
+
+        # retroactively relabel every occurrence already shown in this session
+        tagname = f"spk_{speaker_id}"
+        ranges = self.text.tag_ranges(tagname)
+        self.text.config(state="normal")
+        for i in range(len(ranges) - 2, -1, -2):
+            start, end = ranges[i], ranges[i + 1]
+            self.text.delete(start, end)
+            self.text.insert(start, new_name, tagname)
+        self.text.config(state="disabled")
 
     def close(self):
         self.stop_event.set()
