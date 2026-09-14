@@ -19,6 +19,7 @@ overlays (e.g. one for English, one for Chinese).
 """
 
 import argparse
+import re
 import time
 
 import torch
@@ -40,6 +41,19 @@ CHINESE_TARGETS = {"zh": _t2s, "zh-hant": _s2t}
 
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
 SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+
+# Whisper's task="translate" decoder occasionally fails to actually translate
+# and just echoes the source text back instead (sometimes even through a
+# script conversion, e.g. Simplified->Traditional Chinese) rather than
+# producing English. A "translation" that's mostly non-Latin script is that
+# failure, not a real translation - drop it rather than show it as one.
+_NON_LATIN_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿぀-ヿ가-힯Ѐ-ӿ؀-ۿ]")
+
+
+def _looks_translated(text):
+    if not text:
+        return False
+    return len(_NON_LATIN_RE.findall(text)) / len(text) < 0.3
 
 _nllb_tokenizer = None
 _nllb_model = None
@@ -154,6 +168,8 @@ def make_process_segment(target_lang):
                 condition_on_previous_text=False,
             )
             translated = "".join(s.text for s in en_segments).strip()
+            if not _looks_translated(translated):
+                translated = ""
         else:
             src_flores = LANG_TO_FLORES.get(info.language)
             if src_flores:
@@ -168,11 +184,15 @@ def make_process_segment(target_lang):
                     condition_on_previous_text=False,
                 )
                 en_text = "".join(s.text for s in en_segments).strip()
-                translated = translate_text(en_text, "eng_Latn", target_flores) if en_text else ""
+                translated = translate_text(en_text, "eng_Latn", target_flores) if _looks_translated(en_text) else ""
 
         elapsed = time.time() - t0
-        if translated:
-            _emit_caption(lead, speaker_id, info.language, elapsed, native_text, translated)
+        # The translate pass is a separate decode from the transcribe pass
+        # above and isn't reliability-checked itself - it occasionally comes
+        # back empty even though the native transcription was solid. Show
+        # the native text either way rather than silently dropping the
+        # caption when that happens.
+        _emit_caption(lead, speaker_id, info.language, elapsed, native_text, translated or None)
 
     return process_segment
 

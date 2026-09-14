@@ -20,10 +20,13 @@ few hundred bytes each, no raw audio ever stored.
 import json
 import os
 import threading
+import time
 
+import msvcrt
 import numpy as np
 
 STORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "speakers.json")
+LOCK_PATH = STORE_PATH + ".lock"
 # Cosine similarity on L2-normalized ECAPA-TDNN embeddings. Observed
 # same-speaker scores in practice ranged ~0.2-0.8 - noisy short segments
 # score low even for genuine matches, which is why this also gates new
@@ -35,15 +38,55 @@ MIN_DURATION_FOR_NEW_PROFILE = 0.5  # seconds - shorter clips can still match, j
 _lock = threading.Lock()
 
 
+class _cross_process_lock:
+    """Exclusive lock over speakers.json shared by every translate_vc.py
+    process. threading.Lock alone only serializes calls within one process -
+    with two instances running, each could _load() the same snapshot,
+    independently decide to create the same new_id, and then whichever
+    _save() ran second would silently overwrite the other's profile
+    (a lost update, not just a corrupt file)."""
+
+    def __enter__(self):
+        self._fh = open(LOCK_PATH, "a+b")
+        deadline = time.time() + 30
+        while True:
+            try:
+                self._fh.seek(0)
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+                return self
+            except OSError:
+                if time.time() > deadline:
+                    self._fh.close()
+                    raise
+
+    def __exit__(self, *exc_info):
+        try:
+            self._fh.seek(0)
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            self._fh.close()
+
+
 def _load():
     if not os.path.exists(STORE_PATH):
         return {"next_id": 1, "profiles": {}}
     with open(STORE_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        raw = f.read()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # Multiple translate_vc.py processes share this one file with no
+        # cross-process lock - a bad interleaving of two processes' writes
+        # can corrupt it. Recover whatever valid JSON prefix we can rather
+        # than crashing every future identify() call in every process.
+        data, _ = json.JSONDecoder().raw_decode(raw)
+        return data
 
 
 def _save(data):
-    tmp_path = STORE_PATH + ".tmp"
+    # Unique per-process tmp path so two translate_vc.py instances writing
+    # at the same time can't interleave their writes into one shared file.
+    tmp_path = f"{STORE_PATH}.{os.getpid()}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp_path, STORE_PATH)
@@ -67,7 +110,7 @@ def identify(embedding, duration_sec):
     Returns (speaker_id, display_label). speaker_id is None if the segment
     didn't match anyone and was too short to found a new profile."""
     embedding = _normalize(embedding)
-    with _lock:
+    with _lock, _cross_process_lock():
         data = _load()
         best_id, best_sim = None, -1.0
         for spk_id, profile in data["profiles"].items():
@@ -97,7 +140,7 @@ def identify(embedding, duration_sec):
 
 
 def rename(speaker_id, new_label):
-    with _lock:
+    with _lock, _cross_process_lock():
         data = _load()
         if speaker_id in data["profiles"]:
             data["profiles"][speaker_id]["label"] = new_label

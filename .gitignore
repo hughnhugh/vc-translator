@@ -4,4 +4,5 @@ __pycache__/
 *.log
 logs/
 speakers.json
+speakers.json.*
 pretrained_models/
