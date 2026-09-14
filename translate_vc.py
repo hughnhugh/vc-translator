@@ -1,287 +1,181 @@
 """
 Live translator for Discord (or any system audio).
-Captures whatever your PC is currently playing (WASAPI loopback),
-detects speech with Silero VAD, and translates it to English text
-using faster-whisper (task="translate"), which works directly from
-Vietnamese, Chinese (or most other languages) to English.
+Captures whatever your PC is currently playing (WASAPI loopback) plus your
+mic, detects speech with Silero VAD, and translates it to a target language
+of your choosing (--target). Whisper natively translates any language
+straight into English; for every other target, this pivots through a
+second text-translation model (NLLB-200) since Whisper itself can't
+translate directly into anything but English.
 
 Shows captions in a small always-on-top overlay window.
+
+Usage:
+    python translate_vc.py --target en
+    python translate_vc.py --target zh
+    python translate_vc.py --target az --model medium
+
+Run it twice with different --target values to get two simultaneous
+overlays (e.g. one for English, one for Chinese).
 """
 
-import queue
-import sys
-import threading
+import argparse
 import time
-import tkinter as tk
 
-import numpy as np
-import pyaudiowpatch as pyaudio
 import torch
-from concurrent.futures import ThreadPoolExecutor
-from faster_whisper import WhisperModel
 from opencc import OpenCC
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+
+from lang_codes import WHISPER_TO_FLORES as LANG_TO_FLORES
+from lang_codes import validate_flores_codes
+from overlay_core import caption_q, is_reliable_transcription, run_translator
 
 _t2s = OpenCC("t2s")
+_s2t = OpenCC("s2t")
 
-MODEL_SIZE = "large-v3"   # try "medium" if this feels laggy on your GPU
-DEVICE = "cuda"
-COMPUTE_TYPE = "float16"
+# Whisper only ever reports "zh" (it doesn't distinguish script) - these are
+# the two script variants selectable as --target, both reachable from a "zh"
+# source without any NLLB translation, just a script conversion.
+CHINESE_TARGETS = {"zh": _t2s, "zh-hant": _s2t}
 
-VAD_SAMPLE_RATE = 16000
-FRAME_SAMPLES = 512              # 32ms @ 16kHz, required chunk size for Silero VAD
-SPEECH_THRESHOLD = 0.5
-SILENCE_HANGOVER_SEC = 0.8       # how much trailing silence ends a segment
-MIN_SPEECH_SEC = 0.4             # ignore blips shorter than this
-MAX_SEGMENT_SEC = 6.0            # force a cut even mid-sentence so long monologues don't stall output
+NLLB_MODEL = "facebook/nllb-200-distilled-600M"
 
-MAX_LINES_SHOWN = 4
-
-audio_q: "queue.Queue[bytes]" = queue.Queue()
-caption_q: "queue.Queue[str]" = queue.Queue()
+_nllb_tokenizer = None
+_nllb_model = None
 
 
-def pyaudio_callback(in_data, frame_count, time_info, status):
-    audio_q.put(in_data)
-    return (None, pyaudio.paContinue)
+def _load_nllb():
+    global _nllb_tokenizer, _nllb_model
+    if _nllb_model is None:
+        caption_q.put(f"Loading translation model ({NLLB_MODEL})...")
+        _nllb_tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL)
+        _nllb_model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL).to("cuda").half()
+    return _nllb_tokenizer, _nllb_model
 
 
-def open_loopback_stream(p):
-    wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
-    default_speakers = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-
-    if not default_speakers.get("isLoopbackDevice", False):
-        for loopback in p.get_loopback_device_info_generator():
-            if default_speakers["name"] in loopback["name"]:
-                default_speakers = loopback
-                break
-        else:
-            raise RuntimeError(
-                "Could not find a loopback device matching your default speakers. "
-                "Try setting your Discord/Windows output device explicitly."
-            )
-
-    caption_q.put(f"[Capturing: {default_speakers['name']}]")
-
-    stream = p.open(
-        format=pyaudio.paInt16,
-        channels=default_speakers["maxInputChannels"],
-        rate=int(default_speakers["defaultSampleRate"]),
-        frames_per_buffer=1024,
-        input=True,
-        input_device_index=default_speakers["index"],
-        stream_callback=pyaudio_callback,
-    )
-    return stream, default_speakers
+def translate_text(text, src_flores, target_flores):
+    tokenizer, model = _load_nllb()
+    tokenizer.src_lang = src_flores
+    inputs = tokenizer(text, return_tensors="pt").to("cuda")
+    forced_bos_token_id = tokenizer.convert_tokens_to_ids(target_flores)
+    with torch.no_grad():
+        output = model.generate(**inputs, forced_bos_token_id=forced_bos_token_id, max_new_tokens=200)
+    return tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip()
 
 
-def resample_linear(audio, orig_sr, target_sr):
-    if orig_sr == target_sr or len(audio) == 0:
-        return audio
-    duration = len(audio) / orig_sr
-    target_len = max(1, int(duration * target_sr))
-    x_old = np.linspace(0, duration, num=len(audio), endpoint=False)
-    x_new = np.linspace(0, duration, num=target_len, endpoint=False)
-    return np.interp(x_new, x_old, audio).astype(np.float32)
+def make_process_segment(target_lang):
+    target_flores = LANG_TO_FLORES[target_lang]
 
+    def process_segment(model, segment, source_tag=""):
+        prefix = "[You] " if source_tag == "mic" else ""
 
-def process_segment(model, segment):
-    t0 = time.time()
-    native_segments, info = model.transcribe(
-        segment,
-        task="transcribe",
-        vad_filter=False,
-        beam_size=5,
-    )
-    native_text = "".join(s.text for s in native_segments).strip()
-
-    if info.language == "zh":
-        native_text = _t2s.convert(native_text)
-
-    if info.language == "en":
-        elapsed = time.time() - t0
-        if native_text:
-            caption_q.put(f"[en, {elapsed:.1f}s] {native_text}")
-        return
-
-    en_segments, _ = model.transcribe(
-        segment,
-        task="translate",
-        vad_filter=False,
-        beam_size=5,
-        language=info.language,
-    )
-    en_text = "".join(s.text for s in en_segments).strip()
-
-    elapsed = time.time() - t0
-    if native_text or en_text:
-        caption_q.put(f"[{info.language}, {elapsed:.1f}s] {native_text}\n    -> {en_text}")
-
-
-def audio_worker(stop_event: threading.Event):
-    try:
-        caption_q.put("Loading VAD model...")
-        vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
-
-        caption_q.put(f"Loading Whisper model ({MODEL_SIZE}) on {DEVICE}...")
-        whisper_model = WhisperModel(MODEL_SIZE, device=DEVICE, compute_type=COMPUTE_TYPE)
-
-        p = pyaudio.PyAudio()
-        stream, device_info = open_loopback_stream(p)
-        native_rate = int(device_info["defaultSampleRate"])
-        channels = device_info["maxInputChannels"]
-
-        stream.start_stream()
-        caption_q.put("Listening...")
-
-        executor = ThreadPoolExecutor(max_workers=1)
-
-        leftover = np.zeros(0, dtype=np.float32)
-        speech_buffer = []
-        in_speech = False
-        silence_frames = 0
-        silence_frames_needed = int(SILENCE_HANGOVER_SEC * VAD_SAMPLE_RATE / FRAME_SAMPLES)
-        min_speech_frames = int(MIN_SPEECH_SEC * VAD_SAMPLE_RATE / FRAME_SAMPLES)
-
-        while not stop_event.is_set():
-            try:
-                raw = audio_q.get(timeout=1)
-            except queue.Empty:
-                continue
-
-            pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-            if channels > 1:
-                pcm = pcm.reshape(-1, channels).mean(axis=1)
-
-            pcm_16k = resample_linear(pcm, native_rate, VAD_SAMPLE_RATE)
-            buf = np.concatenate([leftover, pcm_16k])
-
-            n_frames = len(buf) // FRAME_SAMPLES
-            usable = n_frames * FRAME_SAMPLES
-            leftover = buf[usable:]
-
-            for i in range(n_frames):
-                frame = buf[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES]
-                prob = vad_model(torch.from_numpy(frame), VAD_SAMPLE_RATE).item()
-
-                if prob >= SPEECH_THRESHOLD:
-                    speech_buffer.append(frame)
-                    silence_frames = 0
-                    in_speech = True
-                elif in_speech:
-                    speech_buffer.append(frame)
-                    silence_frames += 1
-
-                if in_speech:
-                    total_frames = len(speech_buffer)
-                    duration_sec = total_frames * FRAME_SAMPLES / VAD_SAMPLE_RATE
-                    hit_silence_end = silence_frames >= silence_frames_needed
-                    hit_max_duration = duration_sec >= MAX_SEGMENT_SEC
-                    if hit_silence_end or hit_max_duration:
-                        if total_frames - silence_frames >= min_speech_frames:
-                            segment = np.concatenate(speech_buffer)
-                            executor.submit(process_segment, whisper_model, segment)
-                        speech_buffer = []
-                        silence_frames = 0
-                        # a forced max-duration cut doesn't mean silence started -
-                        # keep accumulating the next chunk right away
-                        in_speech = not hit_silence_end
-
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-    except Exception as e:
-        caption_q.put(f"[ERROR] {type(e).__name__}: {e}")
-
-
-class OverlayApp:
-    def __init__(self, root: tk.Tk, stop_event: threading.Event):
-        self.root = root
-        self.stop_event = stop_event
-        self.lines = []
-
-        root.overrideredirect(True)          # borderless
-        root.attributes("-topmost", True)    # always on top
-        root.attributes("-alpha", 0.85)      # slight transparency
-        root.configure(bg="black")
-
-        screen_w = root.winfo_screenwidth()
-        screen_h = root.winfo_screenheight()
-        win_w, win_h = int(screen_w * 0.6), 260
-        x = (screen_w - win_w) // 2
-        y = screen_h - win_h - 80
-        root.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        root.pack_propagate(False)
-
-        self.label = tk.Label(
-            root,
-            text="Starting...",
-            fg="white",
-            bg="black",
-            font=("Microsoft YaHei UI", 13),
-            justify="left",
-            anchor="sw",
-            wraplength=win_w - 40,
+        t0 = time.time()
+        segments_gen, info = model.transcribe(
+            segment,
+            task="transcribe",
+            vad_filter=False,
+            beam_size=5,
+            condition_on_previous_text=False,
         )
-        self.label.pack(fill="both", expand=True, padx=15, pady=10)
+        native_segments = list(segments_gen)
 
-        close_btn = tk.Label(root, text="✕", fg="white", bg="black", font=("Segoe UI", 10))
-        close_btn.place(relx=1.0, x=-20, y=5)
-        close_btn.bind("<Button-1>", lambda e: self.close())
+        if not is_reliable_transcription(native_segments, info):
+            return
 
-        # drag to move
-        root.bind("<ButtonPress-1>", self._start_drag)
-        root.bind("<B1-Motion>", self._do_drag)
-        self.label.bind("<ButtonPress-1>", self._start_drag)
-        self.label.bind("<B1-Motion>", self._do_drag)
+        native_text = "".join(s.text for s in native_segments).strip()
+        if not native_text:
+            return
 
-        root.bind("<Escape>", lambda e: self.close())
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        if info.language == "zh":
+            native_text = _t2s.convert(native_text)  # normalize display text to Simplified
 
-        self.root.after(100, self.poll_queue)
+            if target_lang in CHINESE_TARGETS:
+                elapsed = time.time() - t0
+                shown = CHINESE_TARGETS[target_lang].convert(native_text)
+                caption_q.put(f"{prefix}[{info.language}, {elapsed:.1f}s] {shown}")
+                return
 
-    def _start_drag(self, event):
-        self._drag_x = event.x
-        self._drag_y = event.y
+        if info.language == target_lang:
+            # already the target language - nothing to translate
+            elapsed = time.time() - t0
+            caption_q.put(f"{prefix}[{info.language}, {elapsed:.1f}s] {native_text}")
+            return
 
-    def _do_drag(self, event):
-        x = self.root.winfo_x() + (event.x - self._drag_x)
-        y = self.root.winfo_y() + (event.y - self._drag_y)
-        self.root.geometry(f"+{x}+{y}")
+        if target_lang == "en":
+            # Whisper's own translate task is a strong, purpose-built X->English
+            # decoder - no need to pivot through NLLB for this common case
+            en_segments, _ = model.transcribe(
+                segment,
+                task="translate",
+                vad_filter=False,
+                beam_size=5,
+                language=info.language,
+                condition_on_previous_text=False,
+            )
+            translated = "".join(s.text for s in en_segments).strip()
+        else:
+            src_flores = LANG_TO_FLORES.get(info.language)
+            if src_flores:
+                translated = translate_text(native_text, src_flores, target_flores)
+            else:
+                en_segments, _ = model.transcribe(
+                    segment,
+                    task="translate",
+                    vad_filter=False,
+                    beam_size=5,
+                    language=info.language,
+                    condition_on_previous_text=False,
+                )
+                en_text = "".join(s.text for s in en_segments).strip()
+                translated = translate_text(en_text, "eng_Latn", target_flores) if en_text else ""
 
-    def poll_queue(self):
-        updated = False
-        while True:
-            try:
-                text = caption_q.get_nowait()
-            except queue.Empty:
-                break
-            self.lines.append(text)
-            self.lines = self.lines[-MAX_LINES_SHOWN:]
-            updated = True
+        elapsed = time.time() - t0
+        if translated:
+            caption_q.put(f"{prefix}[{info.language}, {elapsed:.1f}s] {native_text}\n    -> {translated}")
 
-        if updated:
-            self.label.config(text="\n\n".join(self.lines))
-
-        self.root.after(100, self.poll_queue)
-
-    def close(self):
-        self.stop_event.set()
-        self.root.destroy()
+    return process_segment
 
 
 def main():
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+    parser = argparse.ArgumentParser(description="Live translator overlay for Discord/system audio.")
+    parser.add_argument(
+        "--target", "-t", default="en",
+        help=f"Target language code. Supported: {', '.join(sorted(LANG_TO_FLORES))} (default: en)",
+    )
+    parser.add_argument(
+        "--model", "-m", default=None,
+        help="Whisper model size (default: large-v3 for --target en, medium otherwise)",
+    )
+    parser.add_argument(
+        "--position", choices=["top", "bottom"], default=None,
+        help="Overlay screen anchor (default: bottom for --target en, top otherwise)",
+    )
+    parser.add_argument("--no-mic", action="store_true", help="Don't also capture your microphone")
+    args = parser.parse_args()
 
-    stop_event = threading.Event()
-    worker = threading.Thread(target=audio_worker, args=(stop_event,), daemon=True)
-    worker.start()
+    target = args.target.lower()
+    if target not in LANG_TO_FLORES:
+        raise SystemExit(f"Unsupported target language '{target}'. Supported: {', '.join(sorted(LANG_TO_FLORES))}")
 
-    root = tk.Tk()
-    OverlayApp(root, stop_event)
-    root.mainloop()
+    if target != "en":
+        # Load (and validate) NLLB upfront rather than lazily on first non-native
+        # phrase, so a bad flores code or missing model surfaces immediately.
+        tokenizer, _ = _load_nllb()
+        bad_codes = validate_flores_codes(tokenizer, LANG_TO_FLORES)
+        if bad_codes:
+            print(f"Warning: dropping unrecognized NLLB codes: {sorted(bad_codes)}")
+        if target not in LANG_TO_FLORES:
+            raise SystemExit(f"Target '{target}' was dropped as an unrecognized NLLB code.")
+
+    model_size = args.model or ("large-v3" if target == "en" else "medium")
+    anchor = args.position or ("bottom" if target == "en" else "top")
+
+    run_translator(
+        make_process_segment(target),
+        model_size=model_size,
+        title=f"Live Captions ({target.upper()})",
+        anchor=anchor,
+        capture_mic=not args.no_mic,
+    )
 
 
 if __name__ == "__main__":
