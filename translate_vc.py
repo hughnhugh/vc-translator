@@ -55,6 +55,19 @@ def _looks_translated(text):
         return False
     return len(_NON_LATIN_RE.findall(text)) / len(text) < 0.3
 
+
+def _is_degenerate(text):
+    """NLLB sometimes decodes a short, context-less filler ("Uh-huh.",
+    "Yeah, yeah, yeah.") into a long run of one repeated character instead
+    of a real translation, e.g. ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,". Catch
+    that so it doesn't get shown as if it were a translation."""
+    stripped = text.replace(" ", "")
+    if len(stripped) < 6:
+        return False
+    most_common_count = max(stripped.count(c) for c in set(stripped))
+    return most_common_count / len(stripped) > 0.5
+
+
 _nllb_tokenizer = None
 _nllb_model = None
 _speaker_classifier = None
@@ -189,9 +202,13 @@ def make_process_segment(target_lang):
         elapsed = time.time() - t0
         # The translate pass is a separate decode from the transcribe pass
         # above and isn't reliability-checked itself - it occasionally comes
-        # back empty even though the native transcription was solid. Show
-        # the native text either way rather than silently dropping the
-        # caption when that happens.
+        # back empty, or for a short/context-less filler NLLB can degenerate
+        # into a run of one repeated character, even though the native
+        # transcription was solid. Show the native text either way rather
+        # than silently dropping the caption or showing that as if it were
+        # a translation.
+        if _is_degenerate(translated):
+            translated = ""
         _emit_caption(lead, speaker_id, info.language, elapsed, native_text, translated or None)
 
     return process_segment
