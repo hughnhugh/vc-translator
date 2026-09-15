@@ -7,9 +7,11 @@ Silero VAD, and translates it to a target language of your choosing using
 locally on your GPU, no cloud APIs.
 
 Shows a small always-on-top overlay with the original text and its
-translation. Run the script multiple times with different `--target` values
-to get multiple simultaneous overlays (e.g. one for English, one for
-Chinese).
+translation. Pass a comma-separated `--target` list to get multiple
+simultaneous overlays (e.g. one for English, one for Chinese) from a single
+process - audio capture and Whisper transcription happen once per spoken
+segment and are shared across every target; only the (cheap) translation
+step runs once per target.
 
 ## Requirements
 
@@ -30,26 +32,29 @@ python -m venv venv
 ```powershell
 .\venv\Scripts\python.exe translate_vc.py --target en
 .\venv\Scripts\python.exe translate_vc.py --target zh
+.\venv\Scripts\python.exe translate_vc.py --target en,vi
 ```
 
-An overlay window appears on your screen (bottom for `en`, top for other
-targets by default). Drag it to reposition, click the ✕ or press Escape to
-close, drag the bottom-right corner to resize, and `_` to minimize it to a
-small tab. Have Discord (or whatever app) playing audio through your default
-output device — your microphone is captured too, tagged `[You]`.
+An overlay window appears per target (bottom for `en`, top for other
+targets by default; windows sharing an anchor stack instead of overlapping).
+Drag one to reposition, click its ✕ or press Escape to close just that
+window, drag the bottom-right corner to resize, and `_` to minimize it to a
+small tab. Closing the last remaining window ends the process. Have Discord
+(or whatever app) playing audio through your default output device — your
+microphone is captured too, tagged `[You]`.
 
 ### Options
 
-- `--target LANG` - target language code (default `en`). 93 languages
-  supported out of the box (see `lang_codes.py`), including `zh` (Simplified
-  Chinese) and `zh-hant` (Traditional Chinese) as separate targets. Codes
-  are validated against the loaded NLLB tokenizer at startup - add more to
-  `WHISPER_TO_FLORES` in `lang_codes.py` (needs a valid NLLB flores200 code).
-- `--model SIZE` - Whisper model size (default: `large-v3` for `en`,
-  `medium` for everything else, to leave GPU memory for the second overlay's
-  translation model).
-- `--position top|bottom` - overlay screen anchor (default: `bottom` for
-  `en`, `top` otherwise).
+- `--target LANG[,LANG...]` - one or more comma-separated target language
+  codes (default `en`). 93 languages supported out of the box (see
+  `lang_codes.py`), including `zh` (Simplified Chinese) and `zh-hant`
+  (Traditional Chinese) as separate targets. Codes are validated against the
+  loaded NLLB tokenizer at startup - add more to `WHISPER_TO_FLORES` in
+  `lang_codes.py` (needs a valid NLLB flores200 code).
+- `--model SIZE` - Whisper model size, shared by every target in this
+  process (default: `large-v3`).
+- `--position top|bottom` - overlay screen anchor for every window (default:
+  `bottom` for `en`, `top` otherwise, chosen per target).
 - `--no-mic` - don't capture your microphone, system audio only.
 
 ## Notes
@@ -63,4 +68,4 @@ output device — your microphone is captured too, tagged `[You]`.
 - Chinese speech is normalized to Simplified for display; pick `--target
   zh-hant` if you want Traditional output instead.
 - Every session's captions are logged to `logs/` (gitignored) with
-  timestamps, one file per run.
+  timestamps, one file per overlay window (target) per run.

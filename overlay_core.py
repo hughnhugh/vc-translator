@@ -1,7 +1,8 @@
 """
 Shared audio-capture, VAD segmentation, and overlay-window plumbing used by
-the different translate_vc_*.py entry scripts (each just supplies its own
-process_segment function and picks a Whisper model size / window position).
+translate_vc.py. A single process_segment_fn and audio_worker are shared
+across every requested target language; run_translator just opens one
+overlay window (with its own caption queue and log file) per target.
 """
 
 import os
@@ -40,7 +41,16 @@ NO_SPEECH_PROB_MAX = 0.6
 AVG_LOGPROB_MIN = -1.0
 LANGUAGE_PROB_MIN = 0.5
 
-caption_q: "queue.Queue[str]" = queue.Queue()
+_broadcast_queues: "list[queue.Queue]" = []
+
+
+def register_broadcast_queues(queues):
+    _broadcast_queues[:] = queues
+
+
+def broadcast(msg):
+    for q in _broadcast_queues:
+        q.put(msg)
 
 
 def is_reliable_transcription(segments, info):
@@ -74,7 +84,7 @@ def open_loopback_stream(p, callback):
                 "Try setting your Discord/Windows output device explicitly."
             )
 
-    caption_q.put(f"[Capturing system audio: {default_speakers['name']}]")
+    broadcast(f"[Capturing system audio: {default_speakers['name']}]")
 
     stream = p.open(
         format=pyaudio.paInt16,
@@ -92,7 +102,7 @@ def open_mic_stream(p, callback):
     default_mic = p.get_default_input_device_info()
     channels = min(int(default_mic["maxInputChannels"]), 2) or 1
 
-    caption_q.put(f"[Capturing mic: {default_mic['name']}]")
+    broadcast(f"[Capturing mic: {default_mic['name']}]")
 
     stream = p.open(
         format=pyaudio.paInt16,
@@ -123,7 +133,7 @@ def _capture_loop(stop_event, audio_q, native_rate, channels, vad_model, whisper
                              process_segment_fn, source_tag)
     except Exception as e:
         label = "mic" if source_tag == "mic" else "system audio"
-        caption_q.put(f"[ERROR] {label} capture stopped: {type(e).__name__}: {e}")
+        broadcast(f"[ERROR] {label} capture stopped: {type(e).__name__}: {e}")
 
 
 def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, whisper_model, executor,
@@ -183,10 +193,10 @@ def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, w
 def audio_worker(stop_event: threading.Event, model_size: str, device: str, compute_type: str, process_segment_fn,
                   capture_mic: bool = False):
     try:
-        caption_q.put("Loading VAD model...")
+        broadcast("Loading VAD model...")
         vad_model, _ = torch.hub.load("snakers4/silero-vad", "silero_vad", trust_repo=True)
 
-        caption_q.put(f"Loading Whisper model ({model_size}) on {device}...")
+        broadcast(f"Loading Whisper model ({model_size}) on {device}...")
         whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
         p = pyaudio.PyAudio()
@@ -227,7 +237,7 @@ def audio_worker(stop_event: threading.Event, model_size: str, device: str, comp
             t2.start()
             capture_threads.append(t2)
 
-        caption_q.put("Listening...")
+        broadcast("Listening...")
 
         while not stop_event.is_set():
             time.sleep(0.2)
@@ -237,17 +247,19 @@ def audio_worker(stop_event: threading.Event, model_size: str, device: str, comp
             stream.close()
         p.terminate()
     except Exception as e:
-        caption_q.put(f"[ERROR] {type(e).__name__}: {e}")
+        broadcast(f"[ERROR] {type(e).__name__}: {e}")
 
 
 class OverlayApp:
-    def __init__(self, root: tk.Tk, stop_event: threading.Event, title: str = "Live Captions", anchor: str = "bottom",
-                 log_file=None):
+    def __init__(self, root, stop_event: threading.Event, title: str = "Live Captions", anchor: str = "bottom",
+                 offset_index: int = 0, log_file=None, caption_queue: "queue.Queue" = None, on_close=None):
         self.root = root
         self.stop_event = stop_event
         self.entry_marks = deque()
         self._mark_seq = 0
         self.log_file = log_file
+        self.caption_queue = caption_queue if caption_queue is not None else queue.Queue()
+        self.on_close = on_close
         self._configured_speaker_tags = set()
 
         root.overrideredirect(True)          # borderless
@@ -259,7 +271,8 @@ class OverlayApp:
         screen_h = root.winfo_screenheight()
         self.win_w, self.win_h = int(screen_w * 0.6), 260
         x = (screen_w - self.win_w) // 2
-        y = 80 if anchor == "top" else screen_h - self.win_h - 80
+        stack_offset = offset_index * (self.win_h + 20)
+        y = 80 + stack_offset if anchor == "top" else screen_h - self.win_h - 80 - stack_offset
         root.geometry(f"{self.win_w}x{self.win_h}+{x}+{y}")
         root.pack_propagate(False)
 
@@ -380,7 +393,7 @@ class OverlayApp:
         new_items = []
         while True:
             try:
-                new_items.append(caption_q.get_nowait())
+                new_items.append(self.caption_queue.get_nowait())
             except queue.Empty:
                 break
 
@@ -464,26 +477,55 @@ class OverlayApp:
         self.text.config(state="disabled")
 
     def close(self):
-        self.stop_event.set()
         if self.log_file:
             self.log_file.close()
         self.root.destroy()
+        if self.on_close:
+            self.on_close()
 
 
-def run_translator(process_segment_fn, model_size="large-v3", device="cuda", compute_type="float16",
-                    title="Live Captions", anchor="bottom", capture_mic=False):
+def run_translator(process_segment_fn, window_specs, model_size="large-v3", device="cuda", compute_type="float16",
+                    capture_mic=False):
+    """window_specs: list of {"title", "anchor", "queue"} dicts, one per overlay
+    window - all sharing a single audio_worker (capture + VAD + Whisper)."""
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
 
     os.makedirs(LOG_DIR, exist_ok=True)
-    safe_title = "".join(c if c.isalnum() else "_" for c in title).strip("_")
-    log_path = os.path.join(LOG_DIR, f"{safe_title}_{datetime.now():%Y%m%d_%H%M%S}.log")
-    log_file = open(log_path, "a", encoding="utf-8")
-    caption_q.put(f"[Logging to: {log_path}]")
+    register_broadcast_queues([spec["queue"] for spec in window_specs])
 
     stop_event = threading.Event()
+    root = tk.Tk()
+    root.withdraw()  # hidden - only real purpose is to own the shared mainloop
+
+    remaining = set(range(len(window_specs)))
+    anchor_counts: dict = {}
+
+    for i, spec in enumerate(window_specs):
+        anchor = spec["anchor"]
+        offset_index = anchor_counts.get(anchor, 0)
+        anchor_counts[anchor] = offset_index + 1
+
+        title = spec["title"]
+        safe_title = "".join(c if c.isalnum() else "_" for c in title).strip("_")
+        log_path = os.path.join(LOG_DIR, f"{safe_title}_{datetime.now():%Y%m%d_%H%M%S}.log")
+        log_file = open(log_path, "a", encoding="utf-8")
+        spec["queue"].put(f"[Logging to: {log_path}]")
+
+        def on_close(i=i):
+            remaining.discard(i)
+            if not remaining:
+                stop_event.set()
+                root.quit()
+
+        win = tk.Toplevel(root)
+        OverlayApp(
+            win, stop_event, title=title, anchor=anchor, offset_index=offset_index,
+            log_file=log_file, caption_queue=spec["queue"], on_close=on_close,
+        )
+
     worker = threading.Thread(
         target=audio_worker,
         args=(stop_event, model_size, device, compute_type, process_segment_fn, capture_mic),
@@ -491,6 +533,4 @@ def run_translator(process_segment_fn, model_size="large-v3", device="cuda", com
     )
     worker.start()
 
-    root = tk.Tk()
-    OverlayApp(root, stop_event, title=title, anchor=anchor, log_file=log_file)
     root.mainloop()
