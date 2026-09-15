@@ -376,6 +376,17 @@ class OverlayApp:
         self.text.pack(side="left", fill="both", expand=True)
         scrollbar.config(command=self.text.yview)
 
+        # speaker: who said it, bold accent. meta: "[lang, Xs]", dim/small.
+        # native: the transcription itself, the main readable content.
+        # translated: the "-> ..." line, a distinct warm color so it never
+        # reads as a continuation of the original. status: system/loading
+        # messages, dim/italic so they visually recede from real captions.
+        self.text.tag_config("speaker", foreground="#7ec4ff", font=("Microsoft YaHei UI", 13, "bold"))
+        self.text.tag_config("meta", foreground="#808080", font=("Microsoft YaHei UI", 11))
+        self.text.tag_config("native", foreground="#f2f2f2", font=("Microsoft YaHei UI", 13))
+        self.text.tag_config("translated", foreground="#ffcf6e", font=("Microsoft YaHei UI", 13, "italic"))
+        self.text.tag_config("status", foreground="#808080", font=("Microsoft YaHei UI", 11, "italic"))
+
         resize_grip = tk.Label(self.content_frame, text="◲", fg="gray", bg="black", font=("Segoe UI", 10))
         resize_grip.place(relx=1.0, rely=1.0, x=-4, y=-4, anchor="se")
         resize_grip.config(cursor="size_nw_se")
@@ -454,7 +465,8 @@ class OverlayApp:
             if self.log_file:
                 for item in new_items:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.log_file.write(f"[{timestamp}] {item}\n")
+                    text = self._plain_text(item) if isinstance(item, dict) else item
+                    self.log_file.write(f"[{timestamp}] {text}\n")
                 self.log_file.flush()
 
             at_bottom = self.text.yview()[1] >= 0.999
@@ -467,7 +479,10 @@ class OverlayApp:
                 self._mark_seq += 1
                 self.text.mark_set(mark, "end-1c")
                 self.entry_marks.append(mark)
-                self.text.insert("end", item)
+                if isinstance(item, dict):
+                    self._insert_caption(item)
+                else:
+                    self.text.insert("end", item, "status")
 
             # trim only the oldest entry's own text range - never rebuild the
             # whole widget, or the scrollbar snaps back to the top on every update
@@ -483,6 +498,23 @@ class OverlayApp:
                 self.text.see("end")
 
         self.root.after(100, self.poll_queue)
+
+    def _insert_caption(self, item):
+        if item.get("speaker"):
+            self.text.insert("end", item["speaker"] + " ", "speaker")
+        self.text.insert("end", item["meta"] + " ", "meta")
+        self.text.insert("end", item["native"], "native")
+        if item.get("translated"):
+            self.text.insert("end", "\n    -> ", "meta")
+            self.text.insert("end", item["translated"], "translated")
+
+    @staticmethod
+    def _plain_text(item):
+        parts = [p for p in (item.get("speaker"), item["meta"]) if p]
+        text = " ".join(parts) + " " + item["native"]
+        if item.get("translated"):
+            text += f"\n    -> {item['translated']}"
+        return text
 
     def close(self):
         if self.log_file:

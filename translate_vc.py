@@ -93,10 +93,12 @@ def translate_text(text, src_flores, target_flores):
 
 
 def _emit_caption(q, lead, lang, elapsed, native_text, translated_text=None):
-    body = f"[{lang}, {elapsed:.1f}s] {native_text}"
-    if translated_text is not None:
-        body += f"\n    -> {translated_text}"
-    q.put(f"{lead}{body}")
+    q.put({
+        "speaker": lead.strip(),
+        "meta": f"[{lang}, {elapsed:.1f}s]",
+        "native": native_text,
+        "translated": translated_text,
+    })
 
 
 def make_process_segment(targets, caption_queues):
