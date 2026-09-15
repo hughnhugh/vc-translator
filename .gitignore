@@ -3,6 +3,3 @@ __pycache__/
 *.pyc
 *.log
 logs/
-speakers.json
-speakers.json.*
-pretrained_models/

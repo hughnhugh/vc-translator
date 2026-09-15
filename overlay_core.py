@@ -14,14 +14,13 @@ import tkinter as tk
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from tkinter import simpledialog
 
 import numpy as np
 import pyaudiowpatch as pyaudio
 import torch
 from faster_whisper import WhisperModel
 
-import speaker_store
+import discord_bridge
 
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
 
@@ -31,6 +30,12 @@ SPEECH_THRESHOLD = 0.5
 SILENCE_HANGOVER_SEC = 0.8       # how much trailing silence ends a segment
 MIN_SPEECH_SEC = 0.4             # ignore blips shorter than this
 MAX_SEGMENT_SEC = 6.0            # force a cut even mid-sentence so long monologues don't stall output
+
+# How far back the loopback thread keeps timestamped audio, so a Discord
+# speaking_stop event can slice out exactly the span it covered. Only used
+# when discord_bridge.is_active() - see _drain_discord_segments.
+BRIDGE_BUFFER_WINDOW_SEC = 20.0
+BRIDGE_SLICE_PAD_SEC = 0.2        # clock-skew cushion on each side of a slice
 
 MAX_HISTORY = 300                # cap on stored caption entries so the log doesn't grow unbounded
 
@@ -62,9 +67,9 @@ def is_reliable_transcription(segments, info):
     return avg_no_speech <= NO_SPEECH_PROB_MAX and avg_logprob >= AVG_LOGPROB_MIN
 
 
-def make_pyaudio_callback(audio_q: "queue.Queue[bytes]"):
+def make_pyaudio_callback(audio_q: "queue.Queue[tuple[float, bytes]]"):
     def callback(in_data, frame_count, time_info, status):
-        audio_q.put(in_data)
+        audio_q.put((time.time(), in_data))
         return (None, pyaudio.paContinue)
     return callback
 
@@ -136,6 +141,34 @@ def _capture_loop(stop_event, audio_q, native_rate, channels, vad_model, whisper
         broadcast(f"[ERROR] {label} capture stopped: {type(e).__name__}: {e}")
 
 
+def _slice_timestamped_buffer(buffer, start_ts, end_ts):
+    """buffer: deque of (chunk_start_ts, pcm_16k) - concatenate whichever
+    chunks overlap [start_ts, end_ts] (padded for clock skew). Only
+    chunk-level, not sample-exact, precision - Discord's timestamps and our
+    local capture-time timestamps are close but not perfectly aligned."""
+    lo = start_ts - BRIDGE_SLICE_PAD_SEC
+    hi = end_ts + BRIDGE_SLICE_PAD_SEC
+    parts = [arr for ts, arr in buffer if ts + len(arr) / VAD_SAMPLE_RATE >= lo and ts <= hi]
+    return np.concatenate(parts) if parts else None
+
+
+def _drain_discord_segments(timestamped_buffer, whisper_model, executor, process_segment_fn):
+    """Cuts a segment for every speaking interval the Discord bridge has
+    just closed, using its (user_id, username) as a speaker_hint instead of
+    the VAD + voice-embedding guess. Loopback-only - Discord audio only
+    ever arrives via loopback, never the mic."""
+    for closed in discord_bridge.drain_closed_intervals():
+        duration = closed["end"] - closed["start"]
+        if duration < MIN_SPEECH_SEC:
+            continue
+        start = max(closed["start"], closed["end"] - MAX_SEGMENT_SEC)  # cap runaway segments
+        segment = _slice_timestamped_buffer(timestamped_buffer, start, closed["end"])
+        if segment is None or len(segment) < int(MIN_SPEECH_SEC * VAD_SAMPLE_RATE):
+            continue
+        speaker_hint = (closed["user_id"], closed["username"])
+        executor.submit(process_segment_fn, whisper_model, segment, "", speaker_hint)
+
+
 def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, whisper_model, executor,
                          process_segment_fn, source_tag):
     leftover = np.zeros(0, dtype=np.float32)
@@ -145,9 +178,12 @@ def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, w
     silence_frames_needed = int(SILENCE_HANGOVER_SEC * VAD_SAMPLE_RATE / FRAME_SAMPLES)
     min_speech_frames = int(MIN_SPEECH_SEC * VAD_SAMPLE_RATE / FRAME_SAMPLES)
 
+    is_loopback = source_tag == ""
+    timestamped_buffer: "deque" = deque() if is_loopback else None
+
     while not stop_event.is_set():
         try:
-            raw = audio_q.get(timeout=1)
+            chunk_ts, raw = audio_q.get(timeout=1)
         except queue.Empty:
             continue
 
@@ -156,6 +192,19 @@ def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, w
             pcm = pcm.reshape(-1, channels).mean(axis=1)
 
         pcm_16k = resample_linear(pcm, native_rate, VAD_SAMPLE_RATE)
+
+        if is_loopback:
+            timestamped_buffer.append((chunk_ts, pcm_16k))
+            cutoff = chunk_ts - BRIDGE_BUFFER_WINDOW_SEC
+            while timestamped_buffer and timestamped_buffer[0][0] < cutoff:
+                timestamped_buffer.popleft()
+
+            bridge_active = discord_bridge.is_active()
+            if bridge_active:
+                _drain_discord_segments(timestamped_buffer, whisper_model, executor, process_segment_fn)
+        else:
+            bridge_active = False
+
         buf = np.concatenate([leftover, pcm_16k])
 
         n_frames = len(buf) // FRAME_SAMPLES
@@ -180,7 +229,12 @@ def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, w
                 hit_silence_end = silence_frames >= silence_frames_needed
                 hit_max_duration = duration_sec >= MAX_SEGMENT_SEC
                 if hit_silence_end or hit_max_duration:
-                    if total_frames - silence_frames >= min_speech_frames:
+                    # the Discord bridge, when active, drives loopback
+                    # segmentation itself (see _drain_discord_segments) -
+                    # still run VAD to keep its state warm for an instant,
+                    # glitch-free fallback the moment the bridge drops, but
+                    # don't double-emit the same audio through both paths
+                    if total_frames - silence_frames >= min_speech_frames and not bridge_active:
                         segment = np.concatenate(speech_buffer)
                         executor.submit(process_segment_fn, whisper_model, segment, source_tag)
                     speech_buffer = []
@@ -260,7 +314,6 @@ class OverlayApp:
         self.log_file = log_file
         self.caption_queue = caption_queue if caption_queue is not None else queue.Queue()
         self.on_close = on_close
-        self._configured_speaker_tags = set()
 
         root.overrideredirect(True)          # borderless
         root.attributes("-topmost", True)    # always on top
@@ -400,9 +453,8 @@ class OverlayApp:
         if new_items:
             if self.log_file:
                 for item in new_items:
-                    text = item["text"] if isinstance(item, dict) else item
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.log_file.write(f"[{timestamp}] {text}\n")
+                    self.log_file.write(f"[{timestamp}] {item}\n")
                 self.log_file.flush()
 
             at_bottom = self.text.yview()[1] >= 0.999
@@ -415,12 +467,7 @@ class OverlayApp:
                 self._mark_seq += 1
                 self.text.mark_set(mark, "end-1c")
                 self.entry_marks.append(mark)
-
-                if isinstance(item, dict) and item.get("speaker_id"):
-                    self._insert_with_speaker_tag(item)
-                else:
-                    text = item["text"] if isinstance(item, dict) else item
-                    self.text.insert("end", text)
+                self.text.insert("end", item)
 
             # trim only the oldest entry's own text range - never rebuild the
             # whole widget, or the scrollbar snaps back to the top on every update
@@ -437,45 +484,6 @@ class OverlayApp:
 
         self.root.after(100, self.poll_queue)
 
-    def _insert_with_speaker_tag(self, item):
-        speaker_id = item["speaker_id"]
-        label = item["speaker_label"]
-        text = item["text"]
-        tagname = f"spk_{speaker_id}"
-
-        start = self.text.index("end-1c")
-        self.text.insert("end", label)
-        end = self.text.index("end-1c")
-        self.text.tag_add(tagname, start, end)
-
-        if tagname not in self._configured_speaker_tags:
-            self._configured_speaker_tags.add(tagname)
-            self.text.tag_config(tagname, foreground="#7ec4ff", underline=True)
-            self.text.tag_bind(tagname, "<Enter>", lambda e: self.text.config(cursor="hand2"))
-            self.text.tag_bind(tagname, "<Leave>", lambda e: self.text.config(cursor=""))
-            self.text.tag_bind(tagname, "<Button-1>", lambda e, sid=speaker_id: self.rename_speaker(sid))
-
-        # the rest of the entry after the label (which we just inserted ourselves)
-        self.text.insert("end", text[len(label):])
-
-    def rename_speaker(self, speaker_id):
-        new_name = simpledialog.askstring(
-            "Rename speaker", f"Name for Speaker_{speaker_id}:", parent=self.root
-        )
-        if not new_name:
-            return
-        speaker_store.rename(speaker_id, new_name)
-
-        # retroactively relabel every occurrence already shown in this session
-        tagname = f"spk_{speaker_id}"
-        ranges = self.text.tag_ranges(tagname)
-        self.text.config(state="normal")
-        for i in range(len(ranges) - 2, -1, -2):
-            start, end = ranges[i], ranges[i + 1]
-            self.text.delete(start, end)
-            self.text.insert(start, new_name, tagname)
-        self.text.config(state="disabled")
-
     def close(self):
         if self.log_file:
             self.log_file.close()
@@ -485,7 +493,7 @@ class OverlayApp:
 
 
 def run_translator(process_segment_fn, window_specs, model_size="large-v3", device="cuda", compute_type="float16",
-                    capture_mic=False):
+                    capture_mic=False, discord_bridge_port=discord_bridge.DEFAULT_PORT):
     """window_specs: list of {"title", "anchor", "queue"} dicts, one per overlay
     window - all sharing a single audio_worker (capture + VAD + Whisper)."""
     try:
@@ -495,6 +503,7 @@ def run_translator(process_segment_fn, window_specs, model_size="large-v3", devi
 
     os.makedirs(LOG_DIR, exist_ok=True)
     register_broadcast_queues([spec["queue"] for spec in window_specs])
+    discord_bridge.start(port=discord_bridge_port)
 
     stop_event = threading.Event()
     root = tk.Tk()

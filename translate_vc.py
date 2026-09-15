@@ -28,10 +28,10 @@ import torch
 from opencc import OpenCC
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
-import speaker_store
+import discord_bridge
 from lang_codes import WHISPER_TO_FLORES as LANG_TO_FLORES
 from lang_codes import validate_flores_codes
-from overlay_core import VAD_SAMPLE_RATE, broadcast, is_reliable_transcription, run_translator
+from overlay_core import broadcast, is_reliable_transcription, run_translator
 
 _t2s = OpenCC("t2s")
 _s2t = OpenCC("s2t")
@@ -42,7 +42,6 @@ _s2t = OpenCC("s2t")
 CHINESE_TARGETS = {"zh": _t2s, "zh-hant": _s2t}
 
 NLLB_MODEL = "facebook/nllb-200-distilled-600M"
-SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 
 # Whisper's task="translate" decoder occasionally fails to actually translate
 # and just echoes the source text back instead (sometimes even through a
@@ -72,7 +71,6 @@ def _is_degenerate(text):
 
 _nllb_tokenizer = None
 _nllb_model = None
-_speaker_classifier = None
 
 
 def _load_nllb():
@@ -94,39 +92,11 @@ def translate_text(text, src_flores, target_flores):
     return tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip()
 
 
-def _load_speaker_model():
-    global _speaker_classifier
-    if _speaker_classifier is None:
-        from speechbrain.inference.speaker import EncoderClassifier
-        from speechbrain.utils.fetching import LocalStrategy
-
-        broadcast(f"Loading speaker ID model ({SPEAKER_MODEL})...")
-        _speaker_classifier = EncoderClassifier.from_hparams(
-            source=SPEAKER_MODEL,
-            savedir="pretrained_models/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cuda:0"},
-            local_strategy=LocalStrategy.COPY,  # symlinks need admin/dev-mode privileges on Windows
-        )
-    return _speaker_classifier
-
-
-def identify_speaker(segment_audio):
-    classifier = _load_speaker_model()
-    wav = torch.from_numpy(segment_audio).unsqueeze(0)
-    with torch.no_grad():
-        embedding = classifier.encode_batch(wav).squeeze().cpu().numpy()
-    duration_sec = len(segment_audio) / VAD_SAMPLE_RATE
-    return speaker_store.identify(embedding, duration_sec)
-
-
-def _emit_caption(q, lead, speaker_id, lang, elapsed, native_text, translated_text=None):
+def _emit_caption(q, lead, lang, elapsed, native_text, translated_text=None):
     body = f"[{lang}, {elapsed:.1f}s] {native_text}"
     if translated_text is not None:
         body += f"\n    -> {translated_text}"
-    if speaker_id:
-        q.put({"text": f"{lead}{body}", "speaker_id": speaker_id, "speaker_label": lead.strip()})
-    else:
-        q.put(f"{lead}{body}")
+    q.put(f"{lead}{body}")
 
 
 def make_process_segment(targets, caption_queues):
@@ -135,7 +105,7 @@ def make_process_segment(targets, caption_queues):
     requested target language/overlay - instead of redoing that decode work
     once per target."""
 
-    def process_segment(model, segment, source_tag=""):
+    def process_segment(model, segment, source_tag="", speaker_hint=None):
         t0 = time.time()
         segments_gen, info = model.transcribe(
             segment,
@@ -154,10 +124,15 @@ def make_process_segment(targets, caption_queues):
             return
 
         if source_tag == "mic":
-            lead, speaker_id = "[You] ", None
+            lead = "[You] "
+        elif speaker_hint is not None:
+            # Ground truth from the Discord speaking bridge - the only
+            # source of speaker labels this app has; without it, captions
+            # are unlabeled rather than guessed.
+            _user_id, username = speaker_hint
+            lead = f"{username} "
         else:
-            speaker_id, speaker_label = identify_speaker(segment)
-            lead = f"{speaker_label} "
+            lead = ""
 
         if info.language == "zh":
             native_text = _t2s.convert(native_text)  # normalize display text to Simplified
@@ -190,13 +165,13 @@ def make_process_segment(targets, caption_queues):
             if info.language == "zh" and target_lang in CHINESE_TARGETS:
                 elapsed = time.time() - t0
                 shown = CHINESE_TARGETS[target_lang].convert(native_text)
-                _emit_caption(q, lead, speaker_id, info.language, elapsed, shown)
+                _emit_caption(q, lead, info.language, elapsed, shown)
                 continue
 
             if info.language == target_lang:
                 # already the target language - nothing to translate
                 elapsed = time.time() - t0
-                _emit_caption(q, lead, speaker_id, info.language, elapsed, native_text)
+                _emit_caption(q, lead, info.language, elapsed, native_text)
                 continue
 
             if target_lang == "en":
@@ -219,7 +194,7 @@ def make_process_segment(targets, caption_queues):
             # a translation.
             if _is_degenerate(translated):
                 translated = ""
-            _emit_caption(q, lead, speaker_id, info.language, elapsed, native_text, translated or None)
+            _emit_caption(q, lead, info.language, elapsed, native_text, translated or None)
 
     return process_segment
 
@@ -240,6 +215,10 @@ def main():
         help="Overlay screen anchor for every window (default: bottom for en, top for everything else, per target)",
     )
     parser.add_argument("--no-mic", action="store_true", help="Don't also capture your microphone")
+    parser.add_argument(
+        "--discord-bridge-port", type=int, default=discord_bridge.DEFAULT_PORT,
+        help=f"Port the optional Discord speaking-bridge WebSocket server listens on (default: {discord_bridge.DEFAULT_PORT})",
+    )
     args = parser.parse_args()
 
     targets = list(dict.fromkeys(t.strip().lower() for t in args.target.split(",") if t.strip()))
@@ -277,6 +256,7 @@ def main():
         window_specs,
         model_size=model_size,
         capture_mic=not args.no_mic,
+        discord_bridge_port=args.discord_bridge_port,
     )
 
 

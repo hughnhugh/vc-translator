@@ -24,7 +24,7 @@ step runs once per target.
 python -m venv venv
 .\venv\Scripts\python.exe -m pip install --upgrade pip
 .\venv\Scripts\python.exe -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
-.\venv\Scripts\python.exe -m pip install faster-whisper PyAudioWPatch numpy opencc-python-reimplemented transformers sentencepiece
+.\venv\Scripts\python.exe -m pip install faster-whisper PyAudioWPatch numpy opencc-python-reimplemented transformers sentencepiece websockets
 ```
 
 ## Run
@@ -56,6 +56,24 @@ microphone is captured too, tagged `[You]`.
 - `--position top|bottom` - overlay screen anchor for every window (default:
   `bottom` for `en`, `top` otherwise, chosen per target).
 - `--no-mic` - don't capture your microphone, system audio only.
+
+## Speaker identification (optional, Discord only)
+
+Speaker labels come only from ground truth, never a guess: a companion
+Vencord plugin (`vencord-plugin/discordSpeakingBridge.ts`) reads Discord's
+own "who is currently speaking" state (the same signal behind the green
+speaking ring in the UI) and the real username, and pushes that to a small
+local WebSocket server `translate_vc.py` runs (`--discord-bridge-port`,
+default `8765`). When connected, loopback-audio segment boundaries and
+labels come straight from Discord's own speaking start/stop events. See
+`vencord-plugin/README.md` for build/install steps.
+
+Without the plugin connected, `vc-translator` works exactly the same, just
+with unlabeled captions for system audio (your own `[You]` mic captions are
+always labeled). Note the bridge can't isolate simultaneous speakers' audio
+from each other (that would need a bot with real per-user voice-receive) -
+it only improves *identity and segment timing* on top of the existing
+mixed loopback audio.
 
 ## Notes
 
