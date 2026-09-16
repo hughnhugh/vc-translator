@@ -57,16 +57,31 @@ def _looks_translated(text):
     return len(_NON_LATIN_RE.findall(text)) / len(text) < 0.3
 
 
+_CLAUSE_SPLIT_RE = re.compile(r"[,,。.!!??;;\n]+")
+
+
 def _is_degenerate(text):
     """NLLB sometimes decodes a short, context-less filler ("Uh-huh.",
-    "Yeah, yeah, yeah.") into a long run of one repeated character instead
-    of a real translation, e.g. ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,". Catch
-    that so it doesn't get shown as if it were a translation."""
+    "Yeah, yeah, yeah.") into a degenerate loop instead of a real
+    translation - either a long run of one repeated character (",,,,,,") or
+    the same short phrase repeated over and over, comma-separated (e.g.
+    "我只是很开心,我只是很开心,我只是很开心,..."). Catch both so they don't
+    get shown as if they were a real translation."""
     stripped = text.replace(" ", "")
     if len(stripped) < 6:
         return False
-    most_common_count = max(stripped.count(c) for c in set(stripped))
-    return most_common_count / len(stripped) > 0.5
+
+    most_common_char_count = max(stripped.count(c) for c in set(stripped))
+    if most_common_char_count / len(stripped) > 0.5:
+        return True
+
+    clauses = [c for c in _CLAUSE_SPLIT_RE.split(text) if c.strip()]
+    if len(clauses) >= 4:
+        most_common_clause_count = max(clauses.count(c) for c in set(clauses))
+        if most_common_clause_count >= 4 and most_common_clause_count / len(clauses) > 0.4:
+            return True
+
+    return False
 
 
 _nllb_tokenizer = None
