@@ -25,10 +25,20 @@ def _make_buffer(seconds, chunk_sec=0.1, start_ts=None):
     return buf, start_ts
 
 
+class _FakeModelHolder:
+    """Stands in for overlay_core.ModelHolder - _drain_discord_segments only
+    ever needs .get()."""
+    def __init__(self, model):
+        self._model = model
+
+    def get(self):
+        return self._model
+
+
 def _run_drain(buffer):
     calls = []
     executor = ThreadPoolExecutor(max_workers=1)
-    overlay_core._drain_discord_segments(buffer, "FAKE_MODEL", executor, lambda *a: calls.append(a))
+    overlay_core._drain_discord_segments(buffer, _FakeModelHolder("FAKE_MODEL"), executor, lambda *a: calls.append(a))
     executor.shutdown(wait=True)
     return calls
 

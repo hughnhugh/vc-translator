@@ -93,25 +93,59 @@ async def _handler(websocket):
         _handle_message(msg)
 
 
-async def _serve_forever(port):
+async def _serve_forever(port, stop_event):
     async with serve(_handler, "127.0.0.1", port):
-        await asyncio.Future()  # run until the process exits
+        await stop_event.wait()
+
+
+_loop = None
+_server_stop_event = None
+_server_thread = None
 
 
 def start(port: int = DEFAULT_PORT):
     """Starts the bridge server on a background daemon thread. Safe to call
     even if nothing ever connects - the rest of the app just keeps seeing
-    is_active() == False."""
+    is_active() == False. If a server from a previous start() is still
+    running, call stop() first (e.g. to switch ports live)."""
+    global _loop, _server_stop_event, _server_thread
+
+    ready = threading.Event()
 
     def _run():
+        global _loop, _server_stop_event
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _loop = loop
+        _server_stop_event = asyncio.Event()
+        ready.set()
         try:
-            asyncio.run(_serve_forever(port))
+            loop.run_until_complete(_serve_forever(port, _server_stop_event))
         except Exception as e:
             print(f"[discord-bridge] server stopped: {type(e).__name__}: {e}")
+        finally:
+            loop.close()
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
+    ready.wait(timeout=5)
+    _server_thread = t
     return t
+
+
+def stop(timeout: float = 5.0):
+    """Stops a server started by start(), if any - e.g. right before
+    restarting on a different port. Safe to call even if nothing's running."""
+    global _loop, _server_stop_event, _server_thread
+    if _loop is None or _server_stop_event is None:
+        return
+    loop, stop_event, thread = _loop, _server_stop_event, _server_thread
+    loop.call_soon_threadsafe(stop_event.set)
+    if thread is not None:
+        thread.join(timeout=timeout)
+    _loop = None
+    _server_stop_event = None
+    _server_thread = None
 
 
 def drain_closed_intervals():

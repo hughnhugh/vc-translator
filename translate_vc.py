@@ -20,7 +20,6 @@ step is repeated per target.
 """
 
 import argparse
-import queue
 import re
 import time
 
@@ -31,7 +30,7 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 import discord_bridge
 from lang_codes import WHISPER_TO_FLORES as LANG_TO_FLORES
 from lang_codes import validate_flores_codes
-from overlay_core import broadcast, is_reliable_transcription, run_translator
+from overlay_core import broadcast, is_reliable_transcription, run_translator, status
 
 _t2s = OpenCC("t2s")
 _s2t = OpenCC("s2t")
@@ -91,9 +90,11 @@ _nllb_model = None
 def _load_nllb():
     global _nllb_tokenizer, _nllb_model
     if _nllb_model is None:
+        status.set("nllb", "Loading...")
         broadcast(f"Loading translation model ({NLLB_MODEL})...")
         _nllb_tokenizer = AutoTokenizer.from_pretrained(NLLB_MODEL)
         _nllb_model = AutoModelForSeq2SeqLM.from_pretrained(NLLB_MODEL).to("cuda").half()
+        status.set("nllb", "Ready")
     return _nllb_tokenizer, _nllb_model
 
 
@@ -116,11 +117,13 @@ def _emit_caption(q, lead, lang, elapsed, native_text, translated_text=None):
     })
 
 
-def make_process_segment(targets, caption_queues):
+def make_process_segment(targets, caption_queues, translation_enabled):
     """One shared Whisper transcription (and, when needed, one shared
     Whisper X->English translation) per speech segment, fanned out to every
     requested target language/overlay - instead of redoing that decode work
-    once per target."""
+    once per target. translation_enabled: {target: bool}, flipped live by
+    each overlay's "T" button - when off, that target's window shows the
+    native transcription only and skips the translate decode entirely."""
 
     def process_segment(model, segment, source_tag="", speaker_hint=None):
         t0 = time.time()
@@ -134,10 +137,21 @@ def make_process_segment(targets, caption_queues):
         native_segments = list(segments_gen)
 
         if not is_reliable_transcription(native_segments, info):
+            if source_tag != "mic":
+                # Console-only (not the overlay) - loopback speech getting cut by
+                # VAD/the Discord bridge but then discarded here would otherwise be
+                # invisible, since this is a silent return.
+                avg_no_speech = sum(s.no_speech_prob for s in native_segments) / len(native_segments) if native_segments else None
+                avg_logprob = sum(s.avg_logprob for s in native_segments) / len(native_segments) if native_segments else None
+                print(f"[debug] dropped unreliable segment (source={source_tag!r} speaker_hint={speaker_hint}): "
+                      f"lang={info.language} lang_prob={info.language_probability:.2f} "
+                      f"avg_no_speech={avg_no_speech} avg_logprob={avg_logprob}")
             return
 
         native_text = "".join(s.text for s in native_segments).strip()
         if not native_text:
+            if source_tag != "mic":
+                print(f"[debug] transcription came back empty (source={source_tag!r} speaker_hint={speaker_hint})")
             return
 
         if source_tag == "mic":
@@ -191,8 +205,21 @@ def make_process_segment(targets, caption_queues):
                 _emit_caption(q, lead, info.language, elapsed, native_text)
                 continue
 
+            if not translation_enabled.get(target_lang, True):
+                elapsed = time.time() - t0
+                _emit_caption(q, lead, info.language, elapsed, native_text)
+                continue
+
             if target_lang == "en":
                 translated = whisper_translate_to_en()
+                if not translated:
+                    # Whisper's own translate task occasionally fails outright
+                    # (echoes the source language back instead of translating -
+                    # see _looks_translated) - NLLB is a second, independent
+                    # engine, so try it before giving up on this target entirely.
+                    src_flores = LANG_TO_FLORES.get(info.language)
+                    if src_flores:
+                        translated = translate_text(native_text, src_flores, "eng_Latn")
             else:
                 src_flores = LANG_TO_FLORES.get(info.language)
                 if src_flores:
@@ -219,9 +246,10 @@ def make_process_segment(targets, caption_queues):
 def main():
     parser = argparse.ArgumentParser(description="Live translator overlay for Discord/system audio.")
     parser.add_argument(
-        "--target", "-t", default="en",
+        "--target", "-t", default=None,
         help="Comma-separated target language code(s), e.g. 'en,vi'. One shared audio/transcription "
-             f"pipeline is used, with one overlay window per target. Supported: {', '.join(sorted(LANG_TO_FLORES))} (default: en)",
+             f"pipeline is used, with one overlay window per target. Supported: {', '.join(sorted(LANG_TO_FLORES))} "
+             "(default: shows a GUI picker for this and the other options below)",
     )
     parser.add_argument(
         "--model", "-m", default=None,
@@ -238,42 +266,42 @@ def main():
     )
     args = parser.parse_args()
 
-    targets = list(dict.fromkeys(t.strip().lower() for t in args.target.split(",") if t.strip()))
-    if not targets:
-        raise SystemExit("No target languages given.")
-    for target in targets:
+    # The Settings window (always available - see overlay_core.run_translator)
+    # replaces what used to be a one-shot picker dialog. It's meant to start
+    # hidden/tray-only for scripted launches that shouldn't pop a window
+    # unasked (--target given) - but the tray icon is currently disabled
+    # (see run_translator's comment - pystray segfaults against Tkinter in
+    # this environment), and hidden-with-no-tray would strand it unreachable.
+    # Always show it for now; revert to `args.target is None` once tray's
+    # safe to re-enable.
+    show_settings = True
+    initial_targets = list(dict.fromkeys(t.strip().lower() for t in (args.target or "en").split(",") if t.strip()))
+    for target in initial_targets:
         if target not in LANG_TO_FLORES:
             raise SystemExit(f"Unsupported target language '{target}'. Supported: {', '.join(sorted(LANG_TO_FLORES))}")
 
-    if any(target != "en" for target in targets):
-        # Load (and validate) NLLB upfront rather than lazily on first non-native
-        # phrase, so a bad flores code or missing model surfaces immediately.
-        tokenizer, _ = _load_nllb()
-        bad_codes = validate_flores_codes(tokenizer, LANG_TO_FLORES)
-        if bad_codes:
-            print(f"Warning: dropping unrecognized NLLB codes: {sorted(bad_codes)}")
-        for target in targets:
-            if target not in LANG_TO_FLORES:
-                raise SystemExit(f"Target '{target}' was dropped as an unrecognized NLLB code.")
+    # Targets are now addable live from Settings at any time, not just at
+    # startup - NLLB has to be ready (and bad flores codes dropped) upfront
+    # regardless of what's initially requested, not just when a non-English
+    # target happens to be there on launch.
+    tokenizer, _ = _load_nllb()
+    bad_codes = validate_flores_codes(tokenizer, LANG_TO_FLORES)
+    if bad_codes:
+        print(f"Warning: dropping unrecognized NLLB codes: {sorted(bad_codes)}")
+    for target in initial_targets:
+        if target not in LANG_TO_FLORES:
+            raise SystemExit(f"Target '{target}' was dropped as an unrecognized NLLB code.")
 
     model_size = args.model or "large-v3"
 
-    caption_queues = {target: queue.Queue() for target in targets}
-    window_specs = [
-        {
-            "title": f"Live Captions ({target.upper()})",
-            "anchor": args.position or ("bottom" if target == "en" else "top"),
-            "queue": caption_queues[target],
-        }
-        for target in targets
-    ]
-
     run_translator(
-        make_process_segment(targets, caption_queues),
-        window_specs,
+        make_process_segment,
+        initial_targets,
         model_size=model_size,
         capture_mic=not args.no_mic,
         discord_bridge_port=args.discord_bridge_port,
+        show_settings=show_settings,
+        initial_position=args.position,
     )
 
 

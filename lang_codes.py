@@ -44,6 +44,27 @@ WHISPER_TO_FLORES = {
 }
 
 
+LANGUAGE_NAMES = {
+    "en": "English", "zh": "Chinese (Simplified)", "zh-hant": "Chinese (Traditional)", "de": "German",
+    "es": "Spanish", "ru": "Russian", "ko": "Korean", "fr": "French", "ja": "Japanese", "pt": "Portuguese",
+    "tr": "Turkish", "pl": "Polish", "ca": "Catalan", "nl": "Dutch", "ar": "Arabic", "sv": "Swedish",
+    "it": "Italian", "id": "Indonesian", "hi": "Hindi", "fi": "Finnish", "vi": "Vietnamese", "he": "Hebrew",
+    "uk": "Ukrainian", "el": "Greek", "ms": "Malay", "cs": "Czech", "ro": "Romanian", "da": "Danish",
+    "hu": "Hungarian", "ta": "Tamil", "no": "Norwegian", "th": "Thai", "ur": "Urdu", "hr": "Croatian",
+    "bg": "Bulgarian", "lt": "Lithuanian", "mi": "Maori", "ml": "Malayalam", "cy": "Welsh", "sk": "Slovak",
+    "te": "Telugu", "fa": "Persian", "lv": "Latvian", "bn": "Bengali", "sr": "Serbian", "az": "Azerbaijani",
+    "sl": "Slovenian", "kn": "Kannada", "et": "Estonian", "mk": "Macedonian", "eu": "Basque", "is": "Icelandic",
+    "hy": "Armenian", "ne": "Nepali", "mn": "Mongolian", "bs": "Bosnian", "kk": "Kazakh", "sq": "Albanian",
+    "sw": "Swahili", "gl": "Galician", "mr": "Marathi", "pa": "Punjabi", "si": "Sinhala", "km": "Khmer",
+    "sn": "Shona", "yo": "Yoruba", "so": "Somali", "af": "Afrikaans", "oc": "Occitan", "ka": "Georgian",
+    "be": "Belarusian", "tg": "Tajik", "sd": "Sindhi", "gu": "Gujarati", "am": "Amharic", "yi": "Yiddish",
+    "lo": "Lao", "uz": "Uzbek", "ht": "Haitian Creole", "ps": "Pashto", "tk": "Turkmen",
+    "nn": "Norwegian Nynorsk", "mt": "Maltese", "lb": "Luxembourgish", "my": "Burmese", "bo": "Tibetan",
+    "tl": "Tagalog", "mg": "Malagasy", "as": "Assamese", "ln": "Lingala", "ha": "Hausa", "jw": "Javanese",
+    "su": "Sundanese", "yue": "Cantonese",
+}
+
+
 def validate_flores_codes(tokenizer, mapping):
     """Remove any code the loaded NLLB tokenizer doesn't actually recognize
     (mutates `mapping` in place). Returns the set of bad flores codes found."""
