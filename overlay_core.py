@@ -70,6 +70,10 @@ class SelfCaptionState:
         self._buttons.append(button)
         self._refresh(button)
 
+    def unregister(self, button):
+        if button in self._buttons:
+            self._buttons.remove(button)
+
     def toggle(self):
         self.enabled = not self.enabled
         for button in self._buttons:
@@ -592,11 +596,12 @@ class OverlayApp:
         self.translate_btn.pack(side="right", padx=(0, 4))
         self.translate_btn.bind("<Button-1>", lambda e: self.toggle_translation())
 
+        self.self_caption_btn = None
         if self.self_caption_state is not None:
-            self_caption_btn = tk.Label(title_bar, text="Me", fg="white", bg="#1c1c1c", font=("Segoe UI", 9, "bold"))
-            self_caption_btn.pack(side="right", padx=(0, 4))
-            self_caption_btn.bind("<Button-1>", lambda e: self.self_caption_state.toggle())
-            self.self_caption_state.register(self_caption_btn)
+            self.self_caption_btn = tk.Label(title_bar, text="Me", fg="white", bg="#1c1c1c", font=("Segoe UI", 9, "bold"))
+            self.self_caption_btn.pack(side="right", padx=(0, 4))
+            self.self_caption_btn.bind("<Button-1>", lambda e: self.self_caption_state.toggle())
+            self.self_caption_state.register(self.self_caption_btn)
 
         # Scrollable caption log
         text_container = tk.Frame(self.content_frame, bg="black")
@@ -792,6 +797,8 @@ class OverlayApp:
     def close(self):
         if self.log_file:
             self.log_file.close()
+        if self.self_caption_state is not None and self.self_caption_btn is not None:
+            self.self_caption_state.unregister(self.self_caption_btn)
         self.root.destroy()
         if self.on_close:
             self.on_close()
