@@ -403,7 +403,8 @@ def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, m
 
     is_loopback = source_tag == ""
     timestamped_buffer: "deque" = deque() if is_loopback else None
-    bridge_was_active = False  # only meaningful when is_loopback
+    bridge_was_connected = False  # only meaningful when is_loopback
+    last_bridge_status_text = None
 
     while not stop_event.is_set():
         try:
@@ -423,22 +424,30 @@ def _capture_loop_inner(stop_event, audio_q, native_rate, channels, vad_model, m
             while timestamped_buffer and timestamped_buffer[0][0] < cutoff:
                 timestamped_buffer.popleft()
 
+            connected = discord_bridge.is_connected()
             bridge_active = discord_bridge.is_active()
-            if bridge_active != bridge_was_active:
-                # Surface bridge connect/disconnect - otherwise there's no way to
-                # tell, from the overlay alone, whether loopback segmentation is
-                # coming from Discord's own speaking events or the VAD fallback
-                # (they're mutually exclusive - see the gate a few lines below).
+
+            if connected != bridge_was_connected:
+                # Surface genuine connect/disconnect only - is_active() is an
+                # *activity* signal (gates segmentation below), not a
+                # connection one, and flips on every lull in conversation
+                # even though the WebSocket itself never dropped (see its
+                # docstring). Logging every flip of that would spam the
+                # overlay constantly during completely normal conversation.
                 broadcast(
-                    "[Discord bridge: connected - using Discord speaking events for segmentation]"
-                    if bridge_active else
+                    "[Discord bridge: connected]" if connected else
                     "[Discord bridge: disconnected - falling back to VAD segmentation]"
                 )
-                status.set(
-                    "discord_bridge",
-                    "Connected (Discord speaking events)" if bridge_active else "Listening (no client - VAD fallback)"
-                )
-                bridge_was_active = bridge_active
+                bridge_was_connected = connected
+
+            status_text = (
+                ("Connected (active)" if bridge_active else "Connected (idle - VAD fallback)") if connected
+                else "Listening (no client - VAD fallback)"
+            )
+            if status_text != last_bridge_status_text:
+                status.set("discord_bridge", status_text)
+                last_bridge_status_text = status_text
+
             if bridge_active:
                 _drain_discord_segments(timestamped_buffer, model_holder, executor, process_segment_fn)
         else:

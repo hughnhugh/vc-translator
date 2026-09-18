@@ -25,6 +25,7 @@ _lock = threading.Lock()
 _names: dict = {}
 _intervals: list = []     # [{"user_id", "start", "end"}], end=None while still open
 _last_message_at = 0.0
+_connected_clients = 0    # actual WebSocket connection count, not activity-based
 
 # Segments to cut, one per closed (start, end) speaking interval - this is
 # what actually drives event-driven segmentation in overlay_core.py, rather
@@ -85,12 +86,19 @@ def _handle_message(msg):
 
 
 async def _handler(websocket):
-    async for raw in websocket:
-        try:
-            msg = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        _handle_message(msg)
+    global _connected_clients
+    with _lock:
+        _connected_clients += 1
+    try:
+        async for raw in websocket:
+            try:
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            _handle_message(msg)
+    finally:
+        with _lock:
+            _connected_clients -= 1
 
 
 async def _serve_forever(port, stop_event):
@@ -136,7 +144,7 @@ def start(port: int = DEFAULT_PORT):
 def stop(timeout: float = 5.0):
     """Stops a server started by start(), if any - e.g. right before
     restarting on a different port. Safe to call even if nothing's running."""
-    global _loop, _server_stop_event, _server_thread
+    global _loop, _server_stop_event, _server_thread, _connected_clients
     if _loop is None or _server_stop_event is None:
         return
     loop, stop_event, thread = _loop, _server_stop_event, _server_thread
@@ -146,6 +154,8 @@ def stop(timeout: float = 5.0):
     _loop = None
     _server_stop_event = None
     _server_thread = None
+    with _lock:
+        _connected_clients = 0
 
 
 def drain_closed_intervals():
@@ -162,8 +172,22 @@ def drain_closed_intervals():
 
 
 def is_active() -> bool:
+    """True if a message has arrived recently - used to gate segmentation
+    (see overlay_core._capture_loop_inner): trust the bridge's own
+    speaking-event cuts only while it's recently said something, falling
+    back to VAD otherwise. This is an *activity* signal, not a connection
+    one - it flips constantly during normal conversation (anyone can go
+    quiet for 10+ seconds), so don't use it for a user-facing "connected"
+    status - see is_connected() for that."""
     with _lock:
         return (time.time() - _last_message_at) < ACTIVE_TIMEOUT_SEC
+
+
+def is_connected() -> bool:
+    """True if the Vencord plugin's WebSocket is actually connected right
+    now, regardless of whether anyone's spoken recently."""
+    with _lock:
+        return _connected_clients > 0
 
 
 def speaker_during(start_ts: float, end_ts: float):
